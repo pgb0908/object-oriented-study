@@ -117,7 +117,7 @@ java -cp target/classes gateway.legacy.LegacyDemo
    `Route`는 "나는 이 요청의 것인가?"만 답한다. "여러 개가 다 맞을 때 누가 이기는가"는 개별 `Route`가 알 수 없다. 이 판단을 `Router`가 소유한다. 또 "맞는 Route가 없다"(58행 404)도 `Router`의 답이다.
 8. **감사 로그와 응답: `AuditLog` vs `ResponsePolicy`**
    둘 다 "무엇을 가릴지"를 다루지만 대상이 다르다. 클라이언트에게 보이는 것은 `ResponsePolicy`, 운영자가 보는 것은 `AuditLog`이다. 74행처럼 응답에는 안 나가는데 로그에는 인증 키가 남는 일이 이 둘을 같은 개념으로 묶으면 안 되는 증거다.
-
+claud
 #### 표에 자리가 없는 책임 (귀속처 없음)
 아래 판단과 동작은 어느 개념에도 넣을 수 없었다. 지금은 전부 `handle()`이 쥐고 있다.
 
@@ -188,29 +188,169 @@ java -cp target/classes gateway.legacy.LegacyDemo
 
 | 이전 상태 | 다음 상태 | 언제 | 근거 코드 (줄 번호) |
 |---|---|---|---|
-|  |  |  |  |
+| (생성) | `RECEIVED` | 요청이 들어와 교환이 만들어질 때 | 36 |
+| `RECEIVED` | `FAILED` | 맞는 Route가 없다 (404) | 59 |
+| `RECEIVED` | `FAILED` | 인증 실패 (401) | 70 |
+| `RECEIVED` | `FAILED` | 알 수 없는 인증 설정 (500) | 83 |
+| `RECEIVED` | `AUTHENTICATED` | API 키가 유효하다 | 78 |
+| `RECEIVED` | `AUTHENTICATED` | 인증이 필요 없는 Route다 (`auth=none`) | 81 |
+| `AUTHENTICATED` | `FAILED` | 속도 제한 초과 (429) | 131 |
+| `AUTHENTICATED` | `CALLING` | 속도 제한을 통과해 첫 호출을 시작한다 | 153 |
+| `CALLING` | `RETRYING` | 재시도 대상 응답이고 횟수가 남았다 | 171 |
+| `RETRYING` | `CALLING` | 대기 후 `continue`로 루프 처음으로 돌아가 다음 호출을 시작한다 | 153 (같은 줄, 반복 진입) |
+| `CALLING` | `FAILED` | 응답이 5xx이고 재시도가 끝났다 (502) | 185 |
+| `CALLING` | `COMPLETED` | 응답이 5xx가 아니다 | 190 |
+
+**표를 만들며 알게 된 것**
+
+- 상태는 6개다: `RECEIVED`, `AUTHENTICATED`, `CALLING`, `RETRYING`, `COMPLETED`, `FAILED`.
+- **종료 상태는 `COMPLETED`와 `FAILED`** 두 개다. 코드에서 이 둘에서 나가는 전이는 없다.
+- `FAILED`로 가는 길이 **5개**이고 이전 상태는 `RECEIVED`(3곳), `AUTHENTICATED`, `CALLING` 세 종류다.
+- `RETRYING`은 머무는 상태가 아니다. 171행에서 설정하고 곧바로(대기 100ms 후) 153행의 `CALLING`으로 돌아간다. 이 상태가 "있어야 하는 상태"인지는 불변식을 정할 때 다시 따져야 한다. → **결정: 제거한다** (아래 "결정과 근거").
+- 153행은 두 곳에서 도달한다(`AUTHENTICATED`와 `RETRYING`에서). 같은 줄이 서로 다른 이전 상태를 가진다는 건, 줄 번호만으로는 전이를 정확히 읽을 수 없다는 뜻이다.
+- 상태를 읽는 곳은 223행(로그) 한 곳뿐이다. **어디서도 "지금 이 전이가 허용되는가"를 확인하지 않는다.**
+- 코드에는 없지만 있어야 할 것: `RECEIVED → CALLING`(인증과 속도 제한을 건너뜀), `COMPLETED → RETRYING`, `FAILED → 무엇이든`은 지금 코드상 우연히 일어나지 않을 뿐 막는 코드가 없다.
+
+**설계 전이표 (`RETRYING` 제거 후)** — 위 표는 현재 코드의 기록이라 그대로 두고, 설계는 5개 상태 기준으로 다시 쓴다. 레거시의 171행(`CALLING→RETRYING`)과 153행(`RETRYING→CALLING`) 두 행은 `CALLING→CALLING` 하나로 합쳐진다.
+
+| 이전 상태 | 다음 상태 | 호출 | 언제 |
+|---|---|---|---|
+| (생성) | `RECEIVED` | 생성자 | 요청이 들어온다 |
+| `RECEIVED` | `AUTHENTICATED` | `authenticate(user)` | 인증을 통과했다 (API 키 유효, 또는 인증 불필요) |
+| `RECEIVED` | `FAILED` | `fail(reason)` | 경로 없음, 인증 실패, 인증 설정 오류 |
+| `AUTHENTICATED` | `CALLING` | `startCall(endpoint)` | 속도 제한을 통과해 첫 호출을 시작한다 |
+| `AUTHENTICATED` | `FAILED` | `fail(reason)` | 속도 제한 초과 |
+| `CALLING` | `CALLING` | `retryCall(endpoint)` | 재시도 대상 응답이고 횟수가 남아 다음 호출을 시작한다 |
+| `CALLING` | `COMPLETED` | `complete()` | 응답이 5xx가 아니다 |
+| `CALLING` | `FAILED` | `fail(reason)` | 5xx이고 재시도가 끝났다. 대기 중 중단도 여기에 해당한다 |
 
 **2. 불변식** — `GatewayExchange`가 만들어진 순간부터 항상 참이어야 하는 것들. (예: 재시도 횟수는 0 이상)
 
--
+불변식은 세 종류로 나눈다. (가) 생성 후 바뀌지 않는 값, (나) 상태와 연동된 값, (다) 변화 규칙. 근거는 코드 줄 번호나 전이표다.
+
+**(가) 생성 후 바뀌지 않는 값**
+
+| # | 불변식 | 근거 |
+|---|---|---|
+| A1 | `requestId`는 비어 있지 않고, 생성 후 바뀌지 않는다 | 31 |
+| A2 | `method`, `path`는 null이 아니고, 생성 후 바뀌지 않는다 | 32~33 |
+| A3 | `startedAt`은 생성 시각이고, 바뀌지 않는다 | 38 |
+| A4 | 요청 원본(`headers`, `body`)은 생성 후 바깥에서 바꿔도 교환이 영향받지 않는다 | 34~35. 지금은 `Map` 참조를 그대로 들고 있어서 바깥에서 바꿀 수 있다 |
+
+**(나) 상태와 연동된 값** — "언제부터 존재하는가"가 핵심이다.
+
+| # | 불변식 | 근거 |
+|---|---|---|
+| B1 | `authUser`가 있다 ⟺ 교환이 `AUTHENTICATED`를 거쳤다. 값은 키가 아니라 **사용자 이름**(`alice`, `bob`, `anonymous`)이고, 정해진 뒤에는 바뀌지 않는다 | 77, 80 (각각 78, 81 직전). 59, 70, 83으로 `FAILED`가 된 교환에는 끝까지 없고, 131로 `FAILED`가 된 교환에는 있다 |
+| B2 | `endpoint`가 있다 ⟺ 교환이 `CALLING`을 한 번이라도 거쳤다. B1과 달리 재시도마다 **바뀔 수 있다** | 152 (153 직전). 루프마다 150~151에서 다시 고른다 |
+| B3 | `FAILED` ⟺ 실패 사유가 정확히 하나 있다. 그 외 상태에는 사유가 없다. 사유는 5개다: 경로 없음, 인증 실패, 인증 설정 오류, 속도 제한, 업스트림 장애 | 전이표의 `FAILED` 5행(59, 70, 83, 131, 185). Day 1 겹침 점검 6번. 지금 코드에는 사유 필드가 없고 응답 코드로만 흩어져 있다 |
+
+**(다) 변화 규칙**
+
+| # | 불변식 | 근거 |
+|---|---|---|
+| C1 | `state`는 항상 5개 중 하나이고, 설계 전이표의 **7가지 전이**로만 바뀐다 | 설계 전이표 (생성 행 제외). 같은 전이가 사유별로 여러 행이던 것을 묶었고, `RETRYING` 두 행은 `CALLING→CALLING`으로 합쳐졌다 |
+| C2 | 종료 상태(`COMPLETED`, `FAILED`)에 들어간 뒤에는 어떤 필드도 바뀌지 않는다 | 전이표에서 이 둘에서 나가는 행이 없다. 190행 이후 코드는 `exchange`를 읽기만 한다 (213~225) |
+| C3 | `retryCount`는 0에서 시작하고 `retryCall`로만 정확히 1 증가한다. 줄어들지 않는다 | 37, 172 |
+| C4 | ~~`RETRYING` 전이와 `retryCount` 증가는 하나의 동작이다~~ **삭제** | `RETRYING`을 제거해서 소멸했다. 바뀌는 값이 `retryCount` 하나뿐이라 어긋날 일이 없다. 레거시에서는 171, 172가 별개의 `put` 두 줄이라 그 사이에 어긋난 순간이 있었다 |
+| C5 | ~~`retryCount`는 허용된 최대 재시도 횟수를 넘지 않는다~~ **`GatewayExchange`의 불변식이 아니다** | 최대값을 모르는 객체는 이 규칙을 지킬 수 없다. `RetryPolicy`의 판단으로 옮겼다 (아래 변경 시험). 횟수는 교환이 소유하고 정책은 그 값을 입력으로 받는다 (Day 1 겹침 점검 1번). 레거시는 170행에서 `attempt < maxRetry`를 비교하고, 지역 변수 `attempt`(141, 173)와 `retryCount`가 같은 값을 두 번 센다 |
+
+**생성 직후의 조건 (불변식이 아니다)**: `state`는 `RECEIVED`(36), `retryCount`는 0(37), `authUser`, `endpoint`, 실패 사유는 없다. 생성이 끝난 순간에만 참이고 다음 전이에서 거짓이 되므로 불변식이 아니라 생성자가 보장할 조건이다.
+
+**수정 이력**: 처음 쓴 "초기 state는 RECEIVED"는 위 생성 직후 조건으로 옮겼다. "authUser는 api-key나 anonymous"는 키가 아니라 사용자 이름이고 인증 전에는 없으므로 B1로 고쳤다. `RETRYING`을 제거하면서 C1, C3을 고치고 C4를 삭제했다. 변경 시험의 결과로 C5는 `GatewayExchange`의 불변식에서 빠졌다.
 
 **3. 허용되지 않는 전이** — 위 전이표에 없는 전이 중 막아야 하는 것과 이유.
 
--
+5개 상태 사이의 전이는 25개(자기 자신 5개 포함)이고, 설계 전이표가 허용하는 것은 **7가지**다. 나머지 **18개는 전부 막는다.** 허용 7가지 중 `CALLING→CALLING`만 자기 자신으로 가는 전이이고, 이름 있는 메서드(`retryCall`)로만 가능하다.
+
+**허용 7가지**: `RECEIVED→AUTHENTICATED`, `RECEIVED→FAILED`, `AUTHENTICATED→CALLING`, `AUTHENTICATED→FAILED`, `CALLING→CALLING`, `CALLING→COMPLETED`, `CALLING→FAILED`
+
+**막는 18개**
+
+| 묶음 | 막는 전이 | 개수 | 이유 (근거 불변식) |
+|---|---|---|---|
+| 종료 상태에서 나가기 | `COMPLETED`→{`RECEIVED`, `AUTHENTICATED`, `CALLING`, `FAILED`}, `FAILED`→{`RECEIVED`, `AUTHENTICATED`, `CALLING`, `COMPLETED`} | 8 | C2. 끝난 요청은 다시 열리지 않는다. 특히 `COMPLETED→CALLING`은 이미 응답을 돌려준 요청을 다시 호출하게 만든다 |
+| 단계 건너뛰기 | `RECEIVED→CALLING`, `RECEIVED→COMPLETED`, `AUTHENTICATED→COMPLETED` | 3 | 인증과 속도 제한을 건너뛰거나(B1), 호출한 적이 없는데 완료된다(B2). 지금 코드가 이걸 일으키지 않는 것은 `handle()`의 줄 순서가 우연히 맞아서다 |
+| 뒤로 가기 | `AUTHENTICATED→RECEIVED`, `CALLING→RECEIVED`, `CALLING→AUTHENTICATED` | 3 | 요청은 앞으로만 진행한다. 제자리 반복은 `CALLING→CALLING`(재시도) 하나뿐이다(C1). 재인증이라는 개념이 없고 `authUser`는 한번 정해지면 바뀌지 않는다(B1) |
+| 의미 없는 자기 전이 | `RECEIVED→RECEIVED`, `AUTHENTICATED→AUTHENTICATED`, `COMPLETED→COMPLETED`, `FAILED→FAILED` | 4 | 상태가 바뀌지 않는 전이 호출은 호출하는 쪽의 착오다. 종료 상태의 두 개는 C2다 |
+
+**이전 열린 질문의 결과**: `RETRYING→FAILED`를 막아도 되는가 하는 질문은 `RETRYING`이 사라지면서 소멸했다. 대기 중 `InterruptedException`(176~177행에서 삼키고 있다)을 어떻게 다룰지는 이제 교환 밖의 일이고, 게이트웨이가 `CALLING` 상태에서 `fail(reason)`을 부르면 된다. 그 경로는 이미 허용 전이다.
 
 **4. 이 객체가 거부해야 하는 호출 5가지** — `GatewayExchange`에게 어떤 메서드를 어떤 상태에서 부르면 예외로 거부해야 하는가?
 
--
+`startCall()`처럼 전이마다 이름이 있는 메서드를 둔다고 가정하고, 각 메서드가 어떤 상태에서 불리면 거부해야 하는지를 불변식에서 도출했다. `setState`와 `setRetryCount`는 없다.
+
+| # | 호출 | 거부하는 조건 | 어긴 불변식 | 예외 |
+|---|---|---|---|---|
+| 1 | `retryCall(endpoint)` | `CALLING`이 아닌 모든 상태 (특히 `COMPLETED`, `FAILED`) | C1, C2 | `IllegalStateException` |
+| 2 | `startCall(endpoint)` | `AUTHENTICATED`가 아닌 상태 (특히 `RECEIVED`, 즉 인증 전. `CALLING`에서는 `retryCall`을 써야 한다) | B1, C1 | `IllegalStateException` |
+| 3 | `complete()` | `CALLING`이 아닌 상태 (호출한 적이 없거나 이미 끝났다) | B2, C2 | `IllegalStateException` |
+| 4 | `fail(reason)` | `COMPLETED`, `FAILED`이거나 `reason`이 비어 있다. 두 번 실패하면 사유가 둘이 된다 | B3, C2 | 상태 위반은 `IllegalStateException`, 사유 누락은 `IllegalArgumentException` |
+| 5 | `authenticate(user)` | `RECEIVED`가 아닌 상태이거나 `user`가 비어 있다 | B1 (한번 정해지면 바뀌지 않는다) | 상태 위반은 `IllegalStateException`, 값 누락은 `IllegalArgumentException` |
+
+**거부하지 않는 것 (정책의 몫)**: 재시도 횟수가 최대값에 도달했는지는 `GatewayExchange`가 거부하지 않는다. 최대값을 모르기 때문이다. `RetryPolicy`가 판단하고, 정책 확인 없이 `retryCall`을 부르는 코드는 교환이 막아 주지 못한다 (아래 변경 시험).
+
+**5가지 외에 거부할 것**
+- 생성자: `requestId`, `method`, `path`가 null이거나 비어 있다 (A1, A2)
+- `state`, `retryCount`를 직접 쓰는 길: 거부가 아니라 **표현 자체가 불가능**해야 한다. setter가 없다.
+
+**메서드와 전이의 대응 (코드의 사실상 API 스케치)**
+
+| 메서드 | 출발 상태 | 도착 상태 | 함께 정해지는 값 |
+|---|---|---|---|
+| `authenticate(user)` | `RECEIVED` | `AUTHENTICATED` | `authUser` (B1) |
+| `startCall(endpoint)` | `AUTHENTICATED` | `CALLING` | `endpoint` (B2) |
+| `retryCall(endpoint)` | `CALLING` | `CALLING` | `retryCount + 1` (C3), 새 `endpoint` (B2) |
+| `complete()` | `CALLING` | `COMPLETED` | 없음 |
+| `fail(reason)` | `RECEIVED`, `AUTHENTICATED`, `CALLING` | `FAILED` | 실패 사유 (B3) |
+
+허용 7가지 전이가 메서드 5개로 모두 덮인다. 상태와 연동된 값(B1~B3, C3)이 **전이 메서드의 인자나 부수 효과**로 같이 바뀌므로 상태와 값이 어긋난 순간이 생기지 않는다.
 
 ### 결정과 근거
-- 결정:
-- 다른 선택지:
-- 그걸 버린 이유:
+
+- **결정**: `RETRYING` 상태를 제거한다. 상태는 5개(`RECEIVED`, `AUTHENTICATED`, `CALLING`, `COMPLETED`, `FAILED`)다. 재시도는 `retryCall(endpoint)` 한 동작(`CALLING→CALLING`, `retryCount + 1`, 새 `endpoint`)이다. 재시도 **여부**는 `RetryPolicy`가, **대기**는 게이트웨이가, **횟수 기록**은 `GatewayExchange`가 맡는다.
+- **다른 선택지**:
+  1. `RETRYING`을 유지한다 (`startRetry()`로 들어가고 `startCall()`로 나온다).
+  2. `RETRYING`은 없애되 재시도를 두 단계(`startRetry()` 후 `startCall()`)로 유지한다. 그러면 `startRetry()` 이후 호출이 일어나지 않았는데 상태가 `CALLING`이라 `complete()`가 호출 없이 허용되는 구멍이 생긴다.
+- **그걸 버린 이유** (상태 판정 기준 4가지를 적용했다):
+  - 읽는 쪽이 없다. 상태를 읽는 곳은 223행 로그뿐이고 최종 상태만 찍는다. `RETRYING`은 100ms짜리 순간이다.
+  - `RETRYING`이면 `retryCount ≥ 1`이라는 중복 정보다. 이 중복이 불변식 C4를 만들었다.
+  - `RETRYING`과 `CALLING`의 허용 동작이 다른 것은 재시도를 두 단계로 쪼갰기 때문이다. 한 단계로 합치면 사이 구간과 그 차이가 함께 사라진다.
+  - 상태를 줄이니 불변식 하나(C4)가 사라졌고, 허용 전이는 8가지에서 7가지, 막는 전이는 22개에서 18개로 줄었다.
+- **되살릴 조건**: Day 3의 지수 백오프처럼 대기가 길어지고, "대기 중인 요청"을 구분해서 읽는 소비자(운영 대시보드, 총 대기시간 한도 등)가 생기면 그때 `RETRYING`을 되살린다. 지금 필요 없다는 판단이지 영원히 필요 없다는 판단이 아니다.
+
+**상태를 정하는 기준 (오늘 정리)**
+1. 허용되는 동작이 달라지는가. 같으면 합친다.
+2. 다른 필드에서 유도할 수 있는가. 가능하면 상태로 두지 않는다.
+3. 밖에서 구분해서 읽는 쪽이 있는가. 아무도 없으면 내부 구현이다.
+4. 크기(횟수, 시각)는 필드이고 단계(phase)가 상태다.
+"적을수록 좋다"가 아니라 **불가능한 상태를 표현할 수 없게** 하는 것이 목표다.
 
 ### 변경 시험 — "재시도 최대 횟수를 라우트별로 다르게 설정해야 한다"
 이 규칙을 아는 것은 `GatewayExchange`인가 `Route`인가? 답과 근거, 수정한 파일 수를 센다.
 
--
+**답**: 최대값 자체는 **`RetryPolicy`**가, 그 정책을 어느 경로가 쓰는지는 **`Route`**가 안다. `GatewayExchange`는 둘 다 모른다. ("`Route` 혹은 `RetryPolicy`"라는 처음 답이 맞았다. 둘의 역할이 다르다.)
+
+| 객체 | 아는 것 |
+|---|---|
+| `RetryPolicy` | 최대 횟수 값, 대상 상태코드, 대기 시간 |
+| `Route` | 이 경로는 어느 `RetryPolicy`를 쓰는가 (정책의 규칙은 모른다) |
+| `GatewayExchange` | 현재 `retryCount`와 상태 변경 규칙. 최대값은 모른다 |
+
+**교정**: 처음 답의 "`GatewayExchange`의 책임은 각 동작에 대한 상태 저장"은 "**자기 상태의 변경 규칙을 지킨다. 단, 그 변경을 언제 할지에 대한 정책은 모른다**"로 고친다. 저장만 하는 객체는 `setState`가 하는 일이고, 규칙이 객체 밖에 있는 Day 0 상태(빈약한 도메인 모델)다. 같은 `retryCall()`에서도 거부 조건의 주인이 갈린다.
+
+| 거부 조건 | 주인 |
+|---|---|
+| `CALLING`이 아닌 상태에서 호출 | `GatewayExchange` (자기 상태 규칙, C1·C2) |
+| 횟수가 최대값에 도달 | `RetryPolicy` (정책) |
+
+한 문장: `GatewayExchange`는 **무엇이 허용되는 변화인지**를 알고, 정책은 **변화를 해야 하는지**를 안다.
+
+**협력 구조**: `retryPolicy.shouldRetry(response, exchange.retryCount())`가 참일 때만 `exchange.retryCall(endpoint)`를 부른다. 횟수는 교환이 소유하고 정책은 입력으로 받는다 (Day 1 겹침 점검 1번과 일치).
+
+**비용**: 규칙이 두 객체에 걸쳐 있어서 어느 한쪽이 혼자 지킬 수 없다. 정책 확인 없이 `retryCall`을 부르는 코드를 교환이 막지 못하고, 두 객체를 엮는 조정자(`handle()`)와 Day 6 테스트가 그 책임을 진다.
+
+**수정한 파일 수 (설계상 예상, 구현 후 실측한다)**: `GatewayExchange` 0, `RetryPolicy` 0 (라우트마다 다른 설정의 인스턴스를 만들 뿐), `Route` 0~1 (정책 연결), 조립 지점 1. 레거시도 라우트별 값(`retry=3`, `retry=2`: 105~106행)은 이미 있어서 요구사항 자체는 데이터로는 새롭지 않다. 이 시험이 실제로 재는 것은 **교환이 `Route`나 최대값에 의존하게 되는가**이고, 답은 "의존하면 안 된다"이다. 교환이 최대값을 받는 순간 생성자가 `Route`에 의존한다.
 
 ### 오늘 틀렸던 것
 
