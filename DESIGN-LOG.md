@@ -117,7 +117,7 @@ java -cp target/classes gateway.legacy.LegacyDemo
    `Route`는 "나는 이 요청의 것인가?"만 답한다. "여러 개가 다 맞을 때 누가 이기는가"는 개별 `Route`가 알 수 없다. 이 판단을 `Router`가 소유한다. 또 "맞는 Route가 없다"(58행 404)도 `Router`의 답이다.
 8. **감사 로그와 응답: `AuditLog` vs `ResponsePolicy`**
    둘 다 "무엇을 가릴지"를 다루지만 대상이 다르다. 클라이언트에게 보이는 것은 `ResponsePolicy`, 운영자가 보는 것은 `AuditLog`이다. 74행처럼 응답에는 안 나가는데 로그에는 인증 키가 남는 일이 이 둘을 같은 개념으로 묶으면 안 되는 증거다.
-claud
+
 #### 표에 자리가 없는 책임 (귀속처 없음)
 아래 판단과 동작은 어느 개념에도 넣을 수 없었다. 지금은 전부 `handle()`이 쥐고 있다.
 
@@ -351,6 +351,26 @@ claud
 **비용**: 규칙이 두 객체에 걸쳐 있어서 어느 한쪽이 혼자 지킬 수 없다. 정책 확인 없이 `retryCall`을 부르는 코드를 교환이 막지 못하고, 두 객체를 엮는 조정자(`handle()`)와 Day 6 테스트가 그 책임을 진다.
 
 **수정한 파일 수 (설계상 예상, 구현 후 실측한다)**: `GatewayExchange` 0, `RetryPolicy` 0 (라우트마다 다른 설정의 인스턴스를 만들 뿐), `Route` 0~1 (정책 연결), 조립 지점 1. 레거시도 라우트별 값(`retry=3`, `retry=2`: 105~106행)은 이미 있어서 요구사항 자체는 데이터로는 새롭지 않다. 이 시험이 실제로 재는 것은 **교환이 `Route`나 최대값에 의존하게 되는가**이고, 답은 "의존하면 안 된다"이다. 교환이 최대값을 받는 순간 생성자가 `Route`에 의존한다.
+
+### 구현 결과
+
+`src/main/java/gateway/GatewayExchange.java`, `FailureReason.java` 추가. 테스트 20개 통과 (`GatewayExchangeTest`, 네트워크 없이 0.07초).
+
+- 상태(`State`)는 private enum이다. 외부에는 `isCompleted()`, `isFailed()`, `isFinished()`만 열려 있어 `getState()`로 분기할 수 없다. setter 없음.
+- 거부 조건 5가지와 생성자 검증(A1, A2)을 테스트로 확인했다. 허용 7가지 전이도 각각 확인했다.
+- 요청 헤더는 `Map.copyOf`로 복사해 A4를 지킨다. 본문은 `String`이라 불변이다.
+- 검증이 상태 변경보다 앞서므로, 잘못된 인자로 불러도 상태가 바뀌지 않는다 (테스트로 확인).
+- `FailureReason`은 B3의 사유 5개를 enum으로 둔 것이다. HTTP 상태코드는 모른다 (Day 1 겹침 점검 6번).
+- `endpoint`는 아직 `String`이다. `Endpoint` 타입은 Day 6 요구사항이 오기 전까지 미룬다.
+- `startedAt`은 `Instant`로 생성자에서 받는다. `System.currentTimeMillis()`를 객체 안에서 부르지 않는다 (Day 6 대비).
+
+**변경 시험 실측 ("라우트별 재시도 횟수")**: `GatewayExchange`는 최대값을 받는 곳이 없어서 수정 0개로 확인됐다. `RetryPolicy`와 `Route`는 아직 없으므로 나머지 수치는 Day 3에서 측정한다.
+
+**통과 기준 확인**
+- `set~` 호출 불가능: 확인 (setter 없음).
+- 전이 규칙은 한 군데: `GatewayExchange`의 `requireState`와 `fail`.
+- 외부에서 상태로 분기하는 코드: 없음.
+- 레거시 `ApiGateway.handle()`은 아직 새 객체를 쓰지 않는다. 연결은 Day 3의 일이다.
 
 ### 오늘 틀렸던 것
 
