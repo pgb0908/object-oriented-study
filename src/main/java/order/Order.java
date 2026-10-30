@@ -38,6 +38,10 @@ public class Order {
         return payableAmount;
     }
 
+    public boolean canPay() {
+        return status == Status.CREATED;
+    }
+
     public void pay(Instant paidAt) {
         requireStatus(Status.CREATED, "pay");
         if (paidAt == null) {
