@@ -1,4 +1,6 @@
 package order;
 
-public class Discount {
+public interface Discount {
+
+    long apply(long amount);
 }

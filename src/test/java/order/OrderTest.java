@@ -61,6 +61,62 @@ class OrderTest {
         assertFalse(order.isCancelled());
     }
 
+    // --- 결제 금액 ---
+
+    @Test
+    void 할인이_없으면_결제_금액은_총액과_같다() {
+        Order order = created();
+        assertEquals(order.totalAmount(), order.payableAmount());
+    }
+
+    @Test
+    void 등급_할인을_적용한_결제_금액을_답한다() {
+        Order order = new Order(List.of(new OrderItem("사과", 10000, 1)),
+                List.of(new GradeDiscount(MemberGrade.GOLD)));
+        assertEquals(9000, order.payableAmount());
+        assertEquals(10000, order.totalAmount());
+    }
+
+    @Test
+    void 할인은_목록_순서대로_적용한다() {
+        List<OrderItem> items = List.of(new OrderItem("사과", 10000, 1));
+        Discount gold = new GradeDiscount(MemberGrade.GOLD);
+        Discount coupon = new CouponDiscount(1000);
+
+        assertEquals(8000, new Order(items, List.of(gold, coupon)).payableAmount());
+        assertEquals(8100, new Order(items, List.of(coupon, gold)).payableAmount());
+    }
+
+    @Test
+    void 쿠폰이_총액보다_커도_결제_금액은_0_미만이_되지_않는다() {
+        Order order = new Order(List.of(new OrderItem("사과", 3000, 1)),
+                List.of(new CouponDiscount(5000)));
+        assertEquals(0, order.payableAmount());
+    }
+
+    @Test
+    void 직접_구현한_할인도_똑같이_다룬다() {
+        Discount flat500 = amount -> amount - 500;
+        Order order = new Order(List.of(new OrderItem("사과", 3000, 1)), List.of(flat500));
+        assertEquals(2500, order.payableAmount());
+    }
+
+    @Test
+    void 만든_뒤_바깥에서_할인_목록을_바꿔도_결제_금액은_변하지_않는다() {
+        List<Discount> discounts = new ArrayList<>(List.of(new CouponDiscount(1000)));
+        Order order = new Order(List.of(new OrderItem("사과", 3000, 1)), discounts);
+
+        discounts.add(new CouponDiscount(1000));
+
+        assertEquals(2000, order.payableAmount());
+    }
+
+    @Test
+    void 할인_목록이_없으면_주문을_만들_수_없다() {
+        assertThrows(IllegalArgumentException.class,
+                () -> new Order(List.of(new OrderItem("사과", 3000, 1)), null));
+    }
+
     // --- 상태 전이 ---
 
     @Test

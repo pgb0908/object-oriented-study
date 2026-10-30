@@ -11,18 +11,31 @@ public class Order {
     private enum Status { CREATED, PAID, SHIPPED, CANCELLED }
 
     private final List<OrderItem> items;
+    private final long payableAmount;
     private Status status = Status.CREATED;
     private Instant paidAt;
 
     public Order(List<OrderItem> items) {
+        this(items, List.of());
+    }
+
+    public Order(List<OrderItem> items, List<Discount> discounts) {
         if (items == null || items.isEmpty()) {
             throw new IllegalArgumentException("order needs at least one item");
         }
+        if (discounts == null) {
+            throw new IllegalArgumentException("discounts must not be null");
+        }
         this.items = List.copyOf(items);
+        this.payableAmount = applyAll(List.copyOf(discounts), totalAmount());
     }
 
     public long totalAmount() {
         return items.stream().mapToLong(OrderItem::subtotal).sum();
+    }
+
+    public long payableAmount() {
+        return payableAmount;
     }
 
     public void pay(Instant paidAt) {
@@ -59,6 +72,14 @@ public class Order {
 
     public boolean isCancelled() {
         return status == Status.CANCELLED;
+    }
+
+    private static long applyAll(List<Discount> discounts, long amount) {
+        long result = amount;
+        for (Discount discount : discounts) {
+            result = discount.apply(result);
+        }
+        return result;
     }
 
     private boolean canCancelAt(Instant now) {
